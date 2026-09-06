@@ -51,38 +51,65 @@ def fetch_treasury_yields(lookback_days: int = 365) -> pd.DataFrame:
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_btc_price(days: int = 365):
     """
-    抓取 BTC 價格，依序嘗試三個來源，全部失敗才報錯：
-    1) Binance 公開 K 線 API（免金鑰、限流寬鬆，最推薦）
-    2) CoinGecko（雲端共用 IP 容易被限流 429）
-    3) Stooq 日線 CSV（備援，部分代碼可能不支援）
+    抓取 BTC 價格，依序嘗試四個來源，全部失敗才報錯。
+    Binance.com 在部分雲端主機所在地區會回 451(地區封鎖)，
+    Stooq 近期加上 Cloudflare JS 驗證擋掉一般請求，
+    因此改以 Kraken / CryptoCompare 為主，CoinGecko 當備援。
     回傳 (DataFrame, 資料來源名稱)
     """
     errors = []
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; StreamlitApp/1.0)"}
 
-    # 來源1：Binance
+    # 來源1：Kraken（美國交易所，公開行情 API 無金鑰限制寬鬆）
     try:
-        url = "https://api.binance.com/api/v3/klines"
-        params = {"symbol": "BTCUSDT", "interval": "1d", "limit": min(days, 1000)}
-        r = requests.get(url, params=params, timeout=15)
+        url = "https://api.kraken.com/0/public/OHLC"
+        params = {"pair": "XBTUSD", "interval": 1440}  # 1440分鐘=1天
+        r = requests.get(url, params=params, headers=headers, timeout=15)
         r.raise_for_status()
-        data = r.json()
-        if not isinstance(data, list) or len(data) == 0:
-            raise ValueError(f"回應格式異常：{str(data)[:200]}")
-        rows = [(k[0], float(k[4])) for k in data]  # k[0]=開盤時間, k[4]=收盤價
+        payload = r.json()
+        if payload.get("error"):
+            raise ValueError(f"Kraken 回傳錯誤：{payload['error']}")
+        result = payload.get("result", {})
+        key = next((k for k in result.keys() if k != "last"), None)
+        if key is None:
+            raise ValueError(f"Kraken 回應中找不到資料欄位：{list(result.keys())}")
+        rows = [(row[0], float(row[4])) for row in result[key]]  # row[0]=時間戳(秒), row[4]=收盤價
         df = pd.DataFrame(rows, columns=["ts", "price"])
-        df["date"] = pd.to_datetime(df["ts"], unit="ms").astype("datetime64[ns]")
+        df["date"] = pd.to_datetime(df["ts"], unit="s").astype("datetime64[ns]")
         df = df[["date", "price"]].dropna()
+        cutoff = datetime.now() - timedelta(days=days)
+        df = df[df["date"] >= cutoff]
         if len(df) == 0:
-            raise ValueError("Binance 回傳空資料")
-        return df, "Binance"
+            raise ValueError("Kraken 回傳空資料")
+        return df, "Kraken"
     except Exception as e:
-        errors.append(f"Binance: {e}")
+        errors.append(f"Kraken: {e}")
 
-    # 來源2：CoinGecko
+    # 來源2：CryptoCompare（免金鑰、額度寬鬆）
+    try:
+        url = "https://min-api.cryptocompare.com/data/v2/histoday"
+        params = {"fsym": "BTC", "tsym": "USD", "limit": min(days, 2000)}
+        r = requests.get(url, params=params, headers=headers, timeout=15)
+        r.raise_for_status()
+        payload = r.json()
+        if payload.get("Response") != "Success":
+            raise ValueError(f"CryptoCompare 回傳錯誤：{payload.get('Message', payload)}")
+        data = payload["Data"]["Data"]
+        rows = [(d["time"], float(d["close"])) for d in data if d.get("close")]
+        df = pd.DataFrame(rows, columns=["ts", "price"])
+        df["date"] = pd.to_datetime(df["ts"], unit="s").astype("datetime64[ns]")
+        df = df[["date", "price"]].dropna()
+        df = df[df["price"] > 0]
+        if len(df) == 0:
+            raise ValueError("CryptoCompare 回傳空資料")
+        return df, "CryptoCompare"
+    except Exception as e:
+        errors.append(f"CryptoCompare: {e}")
+
+    # 來源3：CoinGecko（雲端共用 IP 容易被限流 429，當作備援）
     try:
         url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
         params = {"vs_currency": "usd", "days": days}
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; StreamlitApp/1.0)"}
         r = requests.get(url, params=params, headers=headers, timeout=15)
         r.raise_for_status()
         payload = r.json()
@@ -97,29 +124,6 @@ def fetch_btc_price(days: int = 365):
         return df, "CoinGecko"
     except Exception as e:
         errors.append(f"CoinGecko: {e}")
-
-    # 來源3：Stooq（備援，加上 User-Agent 避免被當機器人擋掉）
-    try:
-        import io
-        url = "https://stooq.com/q/d/l/?s=btcusd&i=d"
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; StreamlitApp/1.0)"}
-        r = requests.get(url, headers=headers, timeout=15)
-        r.raise_for_status()
-        df = pd.read_csv(io.StringIO(r.text))
-        df.columns = [c.strip().lower() for c in df.columns]
-        if "date" not in df.columns or "close" not in df.columns:
-            raise ValueError(f"Stooq 欄位不符預期：{list(df.columns)}")
-        df["date"] = pd.to_datetime(df["date"]).astype("datetime64[ns]")
-        df = df.rename(columns={"close": "price"})[["date", "price"]]
-        df["price"] = pd.to_numeric(df["price"], errors="coerce")
-        df = df.dropna()
-        cutoff = datetime.now() - timedelta(days=days)
-        df = df[df["date"] >= cutoff]
-        if len(df) == 0:
-            raise ValueError("Stooq 回傳空資料")
-        return df, "Stooq"
-    except Exception as e:
-        errors.append(f"Stooq: {e}")
 
     raise RuntimeError(" ｜ ".join(errors))
 
