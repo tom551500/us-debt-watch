@@ -40,7 +40,7 @@ def fetch_treasury_yields(lookback_days: int = 365) -> pd.DataFrame:
     url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS2,DGS10,DGS30"
     df = pd.read_csv(url)
     df.columns = ["date", "y2", "y10", "y30"]
-    df["date"] = pd.to_datetime(df["date"])
+    df["date"] = pd.to_datetime(df["date"]).astype("datetime64[ns]")
     for c in ["y2", "y10", "y30"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["y2", "y10", "y30"], how="all")
@@ -69,7 +69,7 @@ def fetch_btc_price(days: int = 365):
             raise ValueError(f"回應中沒有 prices 欄位：{payload}")
         data = payload["prices"]
         df = pd.DataFrame(data, columns=["ts", "price"])
-        df["date"] = pd.to_datetime(df["ts"], unit="ms")
+        df["date"] = pd.to_datetime(df["ts"], unit="ms").astype("datetime64[ns]")
         df = df[["date", "price"]].dropna()
         if len(df) == 0:
             raise ValueError("CoinGecko 回傳空資料")
@@ -84,7 +84,7 @@ def fetch_btc_price(days: int = 365):
         df.columns = [c.strip().lower() for c in df.columns]
         if "date" not in df.columns or "close" not in df.columns:
             raise ValueError(f"Stooq 欄位不符預期：{list(df.columns)}")
-        df["date"] = pd.to_datetime(df["date"])
+        df["date"] = pd.to_datetime(df["date"]).astype("datetime64[ns]")
         df = df.rename(columns={"close": "price"})[["date", "price"]]
         df["price"] = pd.to_numeric(df["price"], errors="coerce")
         df = df.dropna()
@@ -247,8 +247,13 @@ try:
     if "yields" not in dir() or len(yields) == 0:
         raise RuntimeError("殖利率資料尚未成功載入，請先確認上方第1區塊有正常顯示。")
 
+    btc = btc.copy()
+    btc["date"] = pd.to_datetime(btc["date"]).astype("datetime64[ns]")
+    y2_df = yields[["date", "y2"]].copy()
+    y2_df["date"] = pd.to_datetime(y2_df["date"]).astype("datetime64[ns]")
+
     merged = pd.merge_asof(
-        btc.sort_values("date"), yields[["date", "y2"]].sort_values("date"),
+        btc.sort_values("date"), y2_df.sort_values("date"),
         on="date", direction="nearest",
     )
 
