@@ -51,13 +51,34 @@ def fetch_treasury_yields(lookback_days: int = 365) -> pd.DataFrame:
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_btc_price(days: int = 365):
     """
-    抓取 BTC 價格。CoinGecko 免費 API 在雲端主機(如 Streamlit Cloud)常見被
-    共用 IP 觸發 429 限流，因此加上 User-Agent 並在失敗時改用 Stooq 當備援。
+    抓取 BTC 價格，依序嘗試三個來源，全部失敗才報錯：
+    1) Binance 公開 K 線 API（免金鑰、限流寬鬆，最推薦）
+    2) CoinGecko（雲端共用 IP 容易被限流 429）
+    3) Stooq 日線 CSV（備援，部分代碼可能不支援）
     回傳 (DataFrame, 資料來源名稱)
     """
     errors = []
 
-    # 主要來源：CoinGecko
+    # 來源1：Binance
+    try:
+        url = "https://api.binance.com/api/v3/klines"
+        params = {"symbol": "BTCUSDT", "interval": "1d", "limit": min(days, 1000)}
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list) or len(data) == 0:
+            raise ValueError(f"回應格式異常：{str(data)[:200]}")
+        rows = [(k[0], float(k[4])) for k in data]  # k[0]=開盤時間, k[4]=收盤價
+        df = pd.DataFrame(rows, columns=["ts", "price"])
+        df["date"] = pd.to_datetime(df["ts"], unit="ms").astype("datetime64[ns]")
+        df = df[["date", "price"]].dropna()
+        if len(df) == 0:
+            raise ValueError("Binance 回傳空資料")
+        return df, "Binance"
+    except Exception as e:
+        errors.append(f"Binance: {e}")
+
+    # 來源2：CoinGecko
     try:
         url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
         params = {"vs_currency": "usd", "days": days}
@@ -66,7 +87,7 @@ def fetch_btc_price(days: int = 365):
         r.raise_for_status()
         payload = r.json()
         if "prices" not in payload:
-            raise ValueError(f"回應中沒有 prices 欄位：{payload}")
+            raise ValueError(f"回應中沒有 prices 欄位：{str(payload)[:200]}")
         data = payload["prices"]
         df = pd.DataFrame(data, columns=["ts", "price"])
         df["date"] = pd.to_datetime(df["ts"], unit="ms").astype("datetime64[ns]")
@@ -77,10 +98,14 @@ def fetch_btc_price(days: int = 365):
     except Exception as e:
         errors.append(f"CoinGecko: {e}")
 
-    # 備援來源：Stooq（免金鑰、無限流，但只到日線收盤價）
+    # 來源3：Stooq（備援，加上 User-Agent 避免被當機器人擋掉）
     try:
+        import io
         url = "https://stooq.com/q/d/l/?s=btcusd&i=d"
-        df = pd.read_csv(url)
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; StreamlitApp/1.0)"}
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
         df.columns = [c.strip().lower() for c in df.columns]
         if "date" not in df.columns or "close" not in df.columns:
             raise ValueError(f"Stooq 欄位不符預期：{list(df.columns)}")
