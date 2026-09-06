@@ -49,16 +49,54 @@ def fetch_treasury_yields(lookback_days: int = 365) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_btc_price(days: int = 365) -> pd.DataFrame:
-    """從 CoinGecko 抓取 BTC 價格"""
-    url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
-    params = {"vs_currency": "usd", "days": days}
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    data = r.json()["prices"]
-    df = pd.DataFrame(data, columns=["ts", "price"])
-    df["date"] = pd.to_datetime(df["ts"], unit="ms")
-    return df[["date", "price"]]
+def fetch_btc_price(days: int = 365):
+    """
+    抓取 BTC 價格。CoinGecko 免費 API 在雲端主機(如 Streamlit Cloud)常見被
+    共用 IP 觸發 429 限流，因此加上 User-Agent 並在失敗時改用 Stooq 當備援。
+    回傳 (DataFrame, 資料來源名稱)
+    """
+    errors = []
+
+    # 主要來源：CoinGecko
+    try:
+        url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+        params = {"vs_currency": "usd", "days": days}
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; StreamlitApp/1.0)"}
+        r = requests.get(url, params=params, headers=headers, timeout=15)
+        r.raise_for_status()
+        payload = r.json()
+        if "prices" not in payload:
+            raise ValueError(f"回應中沒有 prices 欄位：{payload}")
+        data = payload["prices"]
+        df = pd.DataFrame(data, columns=["ts", "price"])
+        df["date"] = pd.to_datetime(df["ts"], unit="ms")
+        df = df[["date", "price"]].dropna()
+        if len(df) == 0:
+            raise ValueError("CoinGecko 回傳空資料")
+        return df, "CoinGecko"
+    except Exception as e:
+        errors.append(f"CoinGecko: {e}")
+
+    # 備援來源：Stooq（免金鑰、無限流，但只到日線收盤價）
+    try:
+        url = "https://stooq.com/q/d/l/?s=btcusd&i=d"
+        df = pd.read_csv(url)
+        df.columns = [c.strip().lower() for c in df.columns]
+        if "date" not in df.columns or "close" not in df.columns:
+            raise ValueError(f"Stooq 欄位不符預期：{list(df.columns)}")
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.rename(columns={"close": "price"})[["date", "price"]]
+        df["price"] = pd.to_numeric(df["price"], errors="coerce")
+        df = df.dropna()
+        cutoff = datetime.now() - timedelta(days=days)
+        df = df[df["date"] >= cutoff]
+        if len(df) == 0:
+            raise ValueError("Stooq 回傳空資料")
+        return df, "Stooq"
+    except Exception as e:
+        errors.append(f"Stooq: {e}")
+
+    raise RuntimeError(" ｜ ".join(errors))
 
 
 def add_event_lines(fig: go.Figure, y_range=None, row=None, col=None):
@@ -203,7 +241,12 @@ except Exception as e:
 st.header("2. BTC 對比 2 年期殖利率")
 
 try:
-    btc = fetch_btc_price(lookback)
+    btc, btc_source = fetch_btc_price(lookback)
+    st.caption(f"資料來源：{btc_source}")
+
+    if "yields" not in dir() or len(yields) == 0:
+        raise RuntimeError("殖利率資料尚未成功載入，請先確認上方第1區塊有正常顯示。")
+
     merged = pd.merge_asof(
         btc.sort_values("date"), yields[["date", "y2"]].sort_values("date"),
         on="date", direction="nearest",
@@ -225,6 +268,7 @@ try:
     )
 except Exception as e:
     st.error(f"BTC 資料抓取失敗：{e}")
+    st.caption("兩個資料來源(CoinGecko/Stooq)都嘗試過仍失敗時才會顯示這個訊息。可按左側「清除快取重新抓取」再試一次，或稍後再看。")
 
 # ---------------------------------------------------------------------------
 # Section 3: CFTC 10年期公債期貨部位（手動輸入，因官方格式常變動、不穩定）
